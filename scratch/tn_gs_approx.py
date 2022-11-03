@@ -118,6 +118,8 @@ if __name__=="__main__":
     import csv
     from datetime import datetime
     from tqdm import tqdm
+    from quimb.gen.operators import ham_ising
+    from quimb.tensor.tensor_gen import MPO_ham_ising
 
     now = datetime.now().strftime("%d%m%y%H%M%S")
 
@@ -127,7 +129,7 @@ if __name__=="__main__":
     with open(output_fname, 'w') as f:
         f.write("File, GS Overlap, GS Energy, HF Energy, DMRG2 Energy\n")
     files = []
-    with open('filtered_zero_overlap.txt', 'r') as f:
+    with open('filtered_quantum_state.txt', 'r') as f:
         for curr in f:
             files.append(curr.rstrip('\n'))
 
@@ -137,12 +139,19 @@ if __name__=="__main__":
         tqdm.write(f'Calculating properties for {fl}...')
         H_op = PauliwordOp.from_dictionary(dct['hamiltonian'])
         MPO = WordOpToMPO(H_op, max_bond_dim=64)
+        ham = ham_ising(4, jz=-1.0, bx=0.2)
+        print(H.shape)
+        np.save('Isisng_Ham_jzm1_bx02.npy', ham)
+        MPO = MPO_ham_ising(L=4, j=-1.0, bx=0.2)
+#        MPO = ham.build_mpo()
 
         dmrg = DMRG2(MPO, bond_dims=[10, 20, 100, 100, 200], cutoffs=1e-10)
         dmrg.solve(verbosity=0, tol=1e-6)
 
         dmrg_state = dmrg.state.to_dense()
         dmrg_state = QuantumState.from_array(dmrg_state).cleanup(zero_threshold=1e-5)
+        np.save(f'ham_ising_quantum_state.npy', dmrg_state)
+        breakpoint()
 
         gs_energy, gs_vec = exact_gs_energy(H_op.to_sparse_matrix)
         gs_state = QuantumState.from_array(gs_vec).cleanup(zero_threshold=1e-5)
