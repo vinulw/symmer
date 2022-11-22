@@ -20,7 +20,85 @@ def random_pauli_string(n):
 
     return np.random.choice(alphabet, size=n)
 
-def pstring_to_mpo(pstring, debug=False):
+def pstrings_to_mpo(pstrings, coeffs=None, Dmax=None, debug=False):
+    ''' Convert a list of Pauli Strings into an MPO. If coeff list is given,
+    rescale each Pauli string by the corresponding element of the coeff list.
+    Bond dim specifies the maximum bond dimension, if None, no maximum bond
+    dimension.
+
+    TODO: implement truncation for bond dim to work correctly
+    '''
+    if coeffs is None:
+        coeffs = np.ones(len(pstrings))
+
+    if Dmax is None:
+        Dmax = np.inf
+
+    mpo = pstring_to_mpo(pstrings[0], coeffs[0])
+
+    i = 0
+    centre = int(len(mpo) / 2)
+
+    for pstr, coeff in zip(pstrings[1:], coeffs[1:]):
+        _mpo = pstring_to_mpo(pstr, coeff)
+
+        mpo = sum_mpo(mpo, _mpo)
+
+        if debug:
+            print("Summed mpo centre shape: {}".format(mpo[centre].shape))
+        mpo = truncate_MPO(mpo, Dmax)
+        if debug:
+            print("Truncated centre mpo shape: {}".format(mpo[centre].shape))
+            print("")
+
+
+    return mpo
+
+
+def truncated_SVD(M, Dmax=None):
+    U, S, V = np.linalg.svd(M, full_matrices=False)
+
+    if Dmax is not None and len(S) > Dmax:
+        S = S[:Dmax]
+        U = U[:, :Dmax]
+        V = V[:Dmax, :]
+
+    return U, S, V
+
+
+def truncate_MPO(mpo, Dmax, debug=False):
+    if debug:
+        print(f"Curr Dmax: {Dmax}")
+    As = []
+    for n in range(len(mpo) - 1):  # Don't need to run on the last term
+        A = mpo[n]
+        σ, l, i, j = A.shape
+        A = A.reshape(σ * l * i, j)
+        U, S, V = truncated_SVD(A, Dmax)
+        D = len(S)
+
+        # Update current term
+        _A = U.reshape(σ, l, i, D)
+        As.append(_A)
+
+        # Update the next term
+        M = np.diag(S) @ V
+        if debug:
+            print(f"n: {n}")
+            print(f"A: {mpo[n].shape}")
+            print(f"M: {M.shape}")
+            print(f"B: {mpo[n+1].shape}")
+            print(f"A': {_A.shape}")
+        _A1 = ncon([M, mpo[n+1]], ((-3, 1), (-1, -2, 1, -4)))
+        mpo[n+1] = _A1
+
+    As.append(mpo[-1])
+
+    return As
+
+
+
+def pstring_to_mpo(pstring, scaling=None, debug=False):
 
     As = []
     for p in pstring:
@@ -30,6 +108,9 @@ def pstring_to_mpo(pstring, debug=False):
             print(p)
             print(pauli_tensor.shape)
         As.append(pauli_tensor)
+
+    if scaling is not None:
+        As = rescale_mpo(As, scaling)
     return As
 
 def pstring_to_matrix(pstring):
@@ -125,10 +206,7 @@ def rescale_mpo(mpo, amp):
     mpo[0] = mpo[0] * amp
     return mpo
 
-
-
-
-if __name__=="__main__":
+def test_adding_two_mpos():
     import sys
     np.set_printoptions(threshold=sys.maxsize)
 
@@ -188,3 +266,124 @@ if __name__=="__main__":
     print("")
 
     print("Summed allclose third: {}".format(np.allclose(summed_matrix, contract_mpo(summed))))
+
+def PauliWordOp_to_paulis(WordOp):
+    pstrings = []
+    coeffs = []
+    for pauli_vec, coeff in zip(WordOp.symp_matrix, WordOp.coeff_vec):
+        pstrings.append(symplectic_to_string(pauli_vec))
+        coeffs.append(coeff)
+
+    return pstrings, coeffs
+
+def symplectic_to_string(symp_vec) -> str:
+    """
+    Returns string form of symplectic vector defined as (X | Z)
+
+    Args:
+        symp_vec (array): symplectic Pauliword array
+
+    Returns:
+        Pword_string (str): String version of symplectic array
+
+    """
+    n_qubits = len(symp_vec) // 2
+
+    X_block = symp_vec[:n_qubits]
+    Z_block = symp_vec[n_qubits:]
+
+    Y_loc = np.bitwise_and(X_block, Z_block).astype(bool)
+    X_loc = np.bitwise_xor(Y_loc, X_block).astype(bool)
+    Z_loc = np.bitwise_xor(Y_loc, Z_block).astype(bool)
+
+    char_aray = np.array(list('I' * n_qubits), dtype=str)
+
+    char_aray[Y_loc] = 'Y'
+    char_aray[X_loc] = 'X'
+    char_aray[Z_loc] = 'Z'
+
+    Pword_string = ''.join(char_aray)
+
+    return Pword_string
+
+def coefflist_to_complex(coefflist):
+    '''
+    Convert a list of real + imaginary components into a complex vector
+    '''
+    arr = np.array(coefflist, dtype=complex)
+
+    return arr[:, 0] + 1j*arr[:, 1]
+
+
+
+
+def test_pauliwordop_to_mpo():
+    import os
+    from symmer.symplectic.base import PauliwordOp
+    import json
+    import matplotlib.pyplot as plt
+    test_dir = os.path.join(os.path.dirname(os.getcwd()), 'tests')
+    ham_data_dir = os.path.join(test_dir, 'hamiltonian_data')
+
+    print(test_dir)
+    print(ham_data_dir)
+
+    filename = 'H4_STO-3G_SINGLET_JW.json'
+
+    if filename not in os.listdir(ham_data_dir):
+        raise ValueError('unknown file')
+
+    with open(os.path.join(ham_data_dir, filename), 'r') as infile:
+        data_dict = json.load(infile)
+
+
+#    print(data_dict['hamiltonian'])
+    pstrings, coefflist = zip(*data_dict['hamiltonian'].items())
+
+    coeffs = coefflist_to_complex(coefflist)
+
+    print("Number of terms: {}".format(len(pstrings)))
+
+    print('Converting data dict')
+    for pstr, coeff in zip(pstrings[:5], coeffs[:5]):
+        print(f"{pstr}: {coeff}")
+
+#    # Code to do the same conversion with Pauli WordOp
+    wordop = PauliwordOp.from_dictionary(data_dict['hamiltonian'])
+#    pstrings, coeffs = PauliWordOp_to_paulis(wordop)
+#
+#    print("From Pauli Wordop")
+#    for pstr, coeff in zip(pstrings[:5], coeffs[:5]):
+#        print(f"{pstr}: {coeff}")
+
+    print("Preparing mpo...")
+    mpo = pstrings_to_mpo(pstrings, coeffs, Dmax=None)
+
+    print("Contracting mpo...")
+    mpo_matrix = contract_mpo(mpo)
+
+    print("Converting wordop to matrix...")
+    wordop_matrix = wordop.to_sparse_matrix.toarray()
+
+    print(np.allclose(mpo_matrix, wordop_matrix))
+
+    def trace_distance(m1, m2):
+        return np.trace((m1 - m2) * np.conj((m1 - m2).T))
+
+    Dmaxs = [16, 32, 64, 128]
+
+    tdists = []
+    for D in Dmaxs:
+        mpo = pstrings_to_mpo(pstrings, coeffs, Dmax=D)
+        mpo_matrix = contract_mpo(mpo)
+        tdists.append(trace_distance(wordop_matrix, mpo_matrix))
+        print(f"{D}: {tdists[-1]}")
+
+    plt.plot(Dmaxs, tdists, 'x--')
+    plt.show()
+
+
+
+if __name__=="__main__":
+#    test_adding_two_mpos()
+    test_pauliwordop_to_mpo()
