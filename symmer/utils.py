@@ -2,6 +2,7 @@ from symmer.symplectic import PauliwordOp, QuantumState
 import numpy as np
 import scipy as sp
 from typing import Union, List, Tuple
+from functools import reduce
 
 def exact_gs_energy(
         sparse_matrix, 
@@ -52,7 +53,7 @@ def exact_gs_energy(
         raise RuntimeError('No eigenvector of the correct particle number was identified - try increasing n_eigs.')
 
 
-def random_anitcomm_2n_1_PauliwordOp(n_qubits, complex_coeff=True, apply_clifford=True):
+def random_anitcomm_2n_1_PauliwordOp(n_qubits, complex_coeff=True, apply_unitary=True):
     """ Generate a anticommuting PauliOperator of size 2n+1 on n qubits (max possible size)
         with normally distributed coefficients. Generates in structured way then uses Clifford rotation (default)
         to try and make more random (can stop this to allow FAST build, but inherenet structure
@@ -75,92 +76,16 @@ def random_anitcomm_2n_1_PauliwordOp(n_qubits, complex_coeff=True, apply_cliffor
     P_anticomm = PauliwordOp.from_dictionary((dict(zip(P_list, coeff_vec))))
 
     # random rotations to get rid of structure
-    if apply_clifford:
-        for _ in range(10):
-            P_rand = PauliwordOp.random(n_qubits, 1, complex_coeffs=complex_coeff)
-            P_rand.coeff_vec[0] = 1
-            P_anticomm = P_anticomm._rotate_by_single_Pword(P_rand,
-                                                            None)
+    if apply_unitary:
+        U = PauliwordOp.haar_random(n_qubits=n_qubits)
+        P_anticomm = U * P_anticomm * U.dagger
 
     anti_comm_check = P_anticomm.adjacency_matrix.astype(int) - np.eye(P_anticomm.adjacency_matrix.shape[0])
     assert(np.sum(anti_comm_check) == 0), 'operator needs to be made of anti-commuting Pauli operators'
 
     return P_anticomm
 
-
-def get_PauliwordOp_projector(projector: Union[str, List[str], np.array]) -> "PauliwordOp":
+def tensor_list(factor_list:List[PauliwordOp]) -> PauliwordOp:
+    """ Given a list of PauliwordOps, recursively tensor from the right
     """
-    Build PauliwordOp projector onto different qubit states. Using I to leave state unchanged and 0,1,+,-,*,% to fix
-    qubit.
-
-    key:
-        I leaves qubit unchanged
-        0,1 fixes qubit as |0>, |1> (Z basis)
-        +,- fixes qubit as |+>, |-> (X basis)
-        *,% fixes qubit as |i+>, |i-> (Y basis)
-
-    e.g.
-     'I+0*1II' defines the projector the state I ⊗ [ |+ 0 i+ 1>  <+ 0 i+ 1| ]  ⊗ II
-
-    TODO: could be used to develop a control version of PauliWordOp
-
-    Args:
-        projector (str, list) : either string or list of strings defininng projector
-
-    Returns:
-        projector (PauliwordOp): operator that performs projection
-    """
-    if isinstance(projector, str):
-        projector = np.array(list(projector))
-    else:
-        projector = np.asarray(projector)
-    basis_dict = {'I':1,
-                  '0':1, '1':-1,
-                  '+':1, '-':-1,
-                  '*':1, '%':-1}
-    assert len(projector.shape) == 1, 'projector can only be defined over a single string or single list of strings (each a single letter)'
-    assert set(projector).issubset(list(basis_dict.keys())), 'unknown qubit state (must be I,X,Y,Z basis)'
-
-
-    N_qubits = len(projector)
-    qubit_inds_to_fix = np.where(projector!='I')[0]
-    N_qubits_fixed = len(qubit_inds_to_fix)
-    state_sign = np.array([basis_dict[projector[active_ind]] for active_ind in qubit_inds_to_fix])
-
-    if N_qubits_fixed < 64:
-        binary_vec = (((np.arange(2 ** N_qubits_fixed).reshape([-1, 1]) & (1 << np.arange(N_qubits_fixed))[
-                                                                          ::-1])) > 0).astype(int)
-    else:
-        binary_vec = (((np.arange(2 ** N_qubits_fixed, dtype=object).reshape([-1, 1]) & (1 << np.arange(N_qubits_fixed,
-                                                                                                        dtype=object))[
-                                                                                        ::-1])) > 0).astype(int)
-
-    # assign a sign only to 'active positions' (0 in binary not relevent)
-    sign_from_binary = binary_vec * state_sign
-
-    # need to turn 0s in matrix to 1s before taking product across rows
-    sign_from_binary = sign_from_binary + (sign_from_binary + 1) % 2
-
-    sign = np.product(sign_from_binary, axis=1)
-
-    coeff = 1 / 2 ** (N_qubits_fixed) * np.ones(2 ** N_qubits_fixed)
-    sym_arr = np.zeros((coeff.shape[0], 2 * N_qubits))
-
-    # assumed in Z basis
-    sym_arr[:, qubit_inds_to_fix + N_qubits] = binary_vec
-    sym_arr = sym_arr.astype(bool)
-
-    ### fix for Y and X basis
-
-    X_inds_fixed = np.where(np.logical_or(projector == '+', projector == '-'))[0]
-    # swap Z block and X block
-    (sym_arr[:, X_inds_fixed],
-     sym_arr[:,  X_inds_fixed+N_qubits]) = (sym_arr[:, X_inds_fixed+N_qubits],
-                                            sym_arr[:, X_inds_fixed].copy())
-
-    # copy Z block into X block
-    Y_inds_fixed = np.where(np.logical_or(projector == '*', projector == '%'))[0]
-    sym_arr[:, Y_inds_fixed] = sym_arr[:, Y_inds_fixed + N_qubits]
-
-    projector = PauliwordOp(sym_arr, coeff * sign)
-    return projector
+    return reduce(lambda x,y:x.tensor(y), factor_list)

@@ -1,14 +1,16 @@
 import numpy as np
+import pandas as pd
 import networkx as nx
+from tqdm.auto import tqdm
 from copy import deepcopy
 from itertools import product
 from functools import reduce
 from typing import Dict, List, Tuple, Union
 from numbers import Number
 from cached_property import cached_property
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, csc_matrix, coo_matrix
 from symmer.symplectic.utils import *
-from openfermion import QubitOperator
+from openfermion import QubitOperator, count_qubits
 import matplotlib.pyplot as plt
 from qiskit.opflow import PauliOp, PauliSumOp
 from scipy.stats import unitary_group
@@ -119,42 +121,43 @@ class PauliwordOp:
         return cls.from_list(pauli_terms, coeff_vec)
 
     @classmethod
+    def from_openfermion(cls, 
+            openfermion_op: QubitOperator
+        ) -> "PauliwordOp":
+        """ Initialize a PauliwordOp from OpenFermion's QubitOperator representation
+        """
+        assert(isinstance(openfermion_op, QubitOperator)), 'Must supply a QubitOperator'
+        operator_dict = QubitOperator_to_dict(
+            openfermion_op, count_qubits(openfermion_op)
+        )
+        return cls.from_dictionary(operator_dict)
+
+    @classmethod
+    def from_qiskit(cls,
+            qiskit_op: PauliSumOp
+        ) -> "PauliwordOp":
+        """ Initialize a PauliwordOp from Qiskit's PauliSumOp representation
+        """
+        assert(isinstance(qiskit_op, PauliSumOp)), 'Must supply a PauliSumOp'
+        operator_dict = PauliSumOp_to_dict(
+            qiskit_op
+        )
+        return cls.from_dictionary(operator_dict)
+
+    @classmethod
     def empty(cls, 
             n_qubits: int
         ) -> "PauliwordOp":
+        """ Initialize an empty PauliwordOp of the form 0 * I...I
+        """
         return cls.from_dictionary({'I'*n_qubits:0})
 
     @classmethod
-    def from_matrix(cls, 
-            matrix: np.array, 
+    def _from_matrix_full_basis(cls, 
+            matrix: Union[np.array, csr_matrix], 
+            n_qubits: int,
             operator_basis: "PauliwordOp" = None
         ) -> "PauliwordOp":
-        """
-        Given any arbitrary matrix convert it into a linear combination of Pauli operators (PauliwordOp)
-        Note this decomposition builds a basis of size 4^{N_qubits} to decompose matrix into
-        this can be costly! (TODO: may be better way of chosing a basis to represent operator in! aka smaller than 4^N
-                                see jupyter notebook for further details)
-
-        If user doesn't define an operator basis then builds the full 4^N Hilbert space.
-        The user can avoid this by specificying a reduced basis that targets a subspace; there is a check 
-        to assess whether the basis is sufficiently expressible to represent the input matrix in this case.
-        """
-        if isinstance(matrix, np.matrix):
-            # summing over numpy matrices does not function correctly
-            matrix = np.array(matrix)
-
-        n_qubits = int(np.ceil(np.log2(max(matrix.shape))))
-        if n_qubits > 64 and operator_basis is None:
-            # could change XZ_block builder to use numpy objects (allows above 64-bit integers) but very slow and matrix will be too large to build 
-            raise ValueError('Matrix too large! Integer to binary conversion not defined above 64-bits.')
-
-        if not (2**n_qubits, 2**n_qubits) == matrix.shape:
-            # padding matrix with zeros so correct size
-            temp_mat = np.zeros((2 ** n_qubits, 2 ** n_qubits))
-            temp_mat[:matrix.shape[0],
-                :matrix.shape[1]] = matrix
-            matrix = temp_mat
-
         if operator_basis is None:
             # fast method to build all binary assignments
             int_list = np.arange(4 ** (n_qubits))
@@ -165,14 +168,101 @@ class PauliwordOp:
 
         denominator = 2 ** n_qubits
         decomposition = cls.empty(n_qubits)
-        for op in op_basis:
-            const = sum((op.to_sparse_matrix @ matrix).diagonal()) / denominator
+        for op in tqdm(op_basis, desc='Building operator via full basis', total=op_basis.n_terms):
+            if isinstance(matrix, np.ndarray):
+                const = np.einsum(
+                    'ij,ij->', 
+                    op.to_sparse_matrix.toarray(), 
+                    matrix, 
+                    optimize=True
+                ) / denominator
+            else:
+                const = (op.to_sparse_matrix.multiply(matrix)).sum() / denominator
             decomposition += op.multiply_by_constant(const)
 
         operator_out = decomposition.cleanup()
         if operator_basis is not None:
             if not np.all(operator_out.to_sparse_matrix.toarray() == matrix):
-                raise ValueError('Basis not sufficiently expressive.')
+                warnings.warn('Basis not sufficiently expressive, output operator projected onto basis supplied.')
+
+        return operator_out
+
+    @classmethod
+    def _from_matrix_projector(cls, 
+            matrix: Union[np.array, csr_matrix],
+            n_qubits: int
+        ) -> "PauliwordOp":
+        """
+        """
+        if isinstance(matrix, np.ndarray):
+            row, col = np.where(matrix)
+        elif isinstance(matrix, (csr_matrix, csc_matrix, coo_matrix)):
+            row, col = matrix.nonzero()
+        else:
+            raise ValueError('Unrecognised matrix type, must be one of np.array or sp.sparse.csr_matrix')
+        
+        binary_vec = (
+            (
+                np.arange(2 ** n_qubits).reshape([-1, 1]) & 
+                (1 << np.arange(n_qubits))[::-1]
+            ) > 0
+        ).astype(bool)
+
+        P_out = cls.empty(n_qubits)
+        for i,j in tqdm(zip(row, col), desc='Building operator via projectors', total=len(row)):
+            ij_op = get_ij_operator(i,j,n_qubits,binary_vec=binary_vec) 
+            P_out += ij_op * matrix[i,j]
+
+        return P_out
+
+    @classmethod
+    def from_matrix(cls, 
+            matrix: Union[np.array, csr_matrix], 
+            operator_basis: "PauliwordOp" = None,
+            strategy: str = 'projector'
+        ) -> "PauliwordOp":
+        """
+        --------------
+        | strategies |
+        --------------
+        
+        - full_basis
+        
+        If user doesn't define an operator basis then builds the full 4^N Hilbert space - this can be costly!.
+        The user can avoid this by specificying a reduced basis that targets a subspace; there is a check 
+        to assess whether the basis is sufficiently expressible to represent the input matrix in this case.
+        
+        - projector
+
+        Scales as O(M*2^N) where M the number of nonzero elements in the matrix.
+        """
+        if isinstance(matrix, np.matrix):
+            # summing over numpy matrices does not function correctly
+            matrix = np.array(matrix)
+
+        n_qubits = int(np.ceil(np.log2(max(matrix.shape))))
+
+        if n_qubits > 30 and operator_basis is None:
+            # could change XZ_block builder to use numpy objects (allows above 64-bit integers) but very slow and matrix will be too large to build 
+            raise ValueError('Matrix too large! Will run into memory limitations.')
+
+        if not (2**n_qubits, 2**n_qubits) == matrix.shape:
+            # padding matrix with zeros so correct size
+            temp_mat = np.zeros((2 ** n_qubits, 2 ** n_qubits))
+            temp_mat[:matrix.shape[0],
+                :matrix.shape[1]] = matrix
+            matrix = temp_mat
+
+        if strategy == 'full_basis' or operator_basis is not None:
+            operator_out = cls._from_matrix_full_basis(
+                matrix=matrix, n_qubits=n_qubits, operator_basis=operator_basis
+            )
+        elif strategy == 'projector':
+            operator_out = cls._from_matrix_projector(
+                matrix=matrix, n_qubits=n_qubits
+            )
+        else:
+            raise ValueError('Unrecognised strategy, must be one of full_basis or projector')
         
         return operator_out
                 
@@ -203,27 +293,27 @@ class PauliwordOp:
         return deepcopy(self)
 
     def sort(self, 
-            by: str = 'decreasing',
-            key:str = 'magnitude'
+            by:  str = 'magnitude',
+            key: str = 'decreasing'
         ) -> "PauliwordOp":
         """
-        Sort the terms by some key, either magnitude, weight X, Y or Z
+        Sort the terms either by magnitude, weight X, Y or Z
         """
-        if key=='magnitude':
+        if by=='magnitude':
             sort_order = np.argsort(-abs(self.coeff_vec))
-        elif key=='weight':
-            sort_order = np.argsort(-np.sum(self.symp_matrix, axis=1))
-        elif key=='Z':
-            sort_order = np.argsort(np.sum((self.n_qubits+1)*self.X_block + self.Z_block, axis=1))
-        elif key=='X':
-            sort_order = np.argsort(np.sum(self.X_block + (self.n_qubits+1)*self.Z_block, axis=1))
-        elif key=='Y':
-            sort_order = np.argsort(np.sum(abs(self.X_block - self.Z_block), axis=1))
+        elif by=='weight':
+            sort_order = np.argsort(-np.sum(self.symp_matrix.astype(int), axis=1))
+        elif by=='Z':
+            sort_order = np.argsort(np.sum((self.n_qubits+1)*self.X_block.astype(int) + self.Z_block.astype(int), axis=1))
+        elif by=='X':
+            sort_order = np.argsort(np.sum(self.X_block.astype(int) + (self.n_qubits+1)*self.Z_block.astype(int), axis=1))
+        elif by=='Y':
+            sort_order = np.argsort(np.sum(abs(self.X_block.astype(int) - self.Z_block.astype(int)), axis=1))
         else:
-            raise ValueError('Only permitted sort key values are magnitude, weight, X, Y or Z')
-        if by=='increasing':
+            raise ValueError('Only permitted sort by values are magnitude, weight, X, Y or Z')
+        if key=='increasing':
             sort_order = sort_order[::-1]
-        elif by!='decreasing':
+        elif key!='decreasing':
             raise ValueError('Only permitted sort by values are increasing or decreasing')
         return PauliwordOp(self.symp_matrix[sort_order], self.coeff_vec[sort_order])
 
@@ -251,9 +341,9 @@ class PauliwordOp:
         dim = operator_basis.n_terms
         basis_op_stack = np.vstack([operator_basis.symp_matrix, self.symp_matrix])
         reduced = cref_binary(basis_op_stack)
-        index_successfully_reconstructed = np.where(np.all(~reduced[dim:,dim:], axis=1))[0]
+        mask_successfully_reconstructed = np.all(~reduced[dim:,dim:], axis=1)
         op_reconstruction = reduced[dim:,:dim]
-        return op_reconstruction, index_successfully_reconstructed
+        return op_reconstruction, mask_successfully_reconstructed
 
     @cached_property
     def Y_count(self) -> np.array:
@@ -395,6 +485,24 @@ class PauliwordOp:
             )
         return pauli_mult_out
 
+    def _multiply_by_operator_parallel(self, 
+            PwordOp: Union["PauliwordOp", "QuantumState", complex],
+            zero_threshold: float = 1e-15
+        ) -> "PauliwordOp":
+        """ Right-multiplication of this PauliwordOp by another PauliwordOp or QuantumState ket.
+        """
+        assert (self.n_qubits == PwordOp.n_qubits), 'PauliwordOps defined for different number of qubits'
+
+        # multiplication is performed at the symplectic level, before being stacked and cleaned
+        
+        symp_matrix, coeff_vec = collect_multiplication_stack(self, PwordOp)
+        pauli_mult_out = PauliwordOp(
+            *symplectic_cleanup_parallel(
+                symp_matrix, coeff_vec, zero_threshold=zero_threshold
+            )
+        )
+        return pauli_mult_out
+
     def __mul__(self, 
             mul_obj: Union["PauliwordOp", "QuantumState", complex],
             zero_threshold: float = 1e-15
@@ -464,6 +572,10 @@ class PauliwordOp:
             if stop is None:
                 stop=self.n_terms
             mask = np.arange(start, stop, key.step)
+        elif isinstance(key, (list, np.ndarray)):
+            mask = np.asarray(key)
+        else:
+            raise ValueError('Unrecognised input, must be an integer, slice, list or np.array')
         
         symp_items = self.symp_matrix[mask]
         coeff_items = self.coeff_vec[mask]
@@ -640,6 +752,17 @@ class PauliwordOp:
             op_copy = op_copy._rotate_by_single_Pword(pauli_rotation, angle).cleanup()
         return op_copy
 
+    def tensor(self, right_op: "PauliwordOp") -> "PauliwordOp":
+        """ Tensor current Pauli operator with another on the right (cannot interlace currently)
+        """
+        identity_block_right = np.zeros([right_op.n_terms, self.n_qubits]).astype(int)
+        identity_block_left  = np.zeros([self.n_terms,  right_op.n_qubits]).astype(int)
+        padded_left_symp = np.hstack([self.X_block, identity_block_left, self.Z_block, identity_block_left])
+        padded_right_symp = np.hstack([identity_block_right, right_op.X_block, identity_block_right, right_op.Z_block])
+        left_factor = PauliwordOp(padded_left_symp, self.coeff_vec)
+        right_factor = PauliwordOp(padded_right_symp, right_op.coeff_vec)
+        return left_factor * right_factor
+
     def get_graph(self, 
             edge_relation = 'C'
         ) -> nx.graph:
@@ -657,7 +780,7 @@ class PauliwordOp:
             raise TypeError('Unrecognised edge relation, must be one of C (commuting), AC (anticommuting) or QWC (qubitwise commuting).')
         np.fill_diagonal(adjmat,False) # avoids self-adjacency
         # convert to a networkx graph and perform colouring on complement
-        graph = nx.from_numpy_matrix(adjmat)
+        graph = nx.from_numpy_array(adjmat)
         return graph
 
     def largest_clique(self,
@@ -701,7 +824,7 @@ class PauliwordOp:
             if colouring_interchange is not False:
                 warnings.warn(f'{strategy} is not a graph colouring method, so colouring_interchange flag is ignored')
 
-            sorted_op_list = list(self.sort(by='decreasing', key='magnitude'))
+            sorted_op_list = list(self.sort(by='magnitude', key='decreasing'))
 
             check_dic = {
                 'C': lambda x, y: np.all(x.commutes_termwise(y)),
@@ -780,6 +903,22 @@ class PauliwordOp:
         out_dict = {symplectic_to_string(symp_vec):coeff for symp_vec, coeff
                     in zip(op_to_convert.symp_matrix, op_to_convert.coeff_vec)}
         return out_dict
+
+    @cached_property
+    def to_dataframe(self) -> pd.DataFrame:
+        """ Convert operator to pd.DataFrame for easy conversion to LaTeX
+        """
+        paulis = list(self.to_dictionary.keys())
+        DF_out = pd.DataFrame.from_dict({
+            'Pauli terms': paulis, 
+            'Coefficients (real)': self.coeff_vec.real
+            }
+        )
+        if np.any(self.coeff_vec.imag):
+            DF_out['Coefficients (imaginary)'] = self.coeff_vec.imag
+        return DF_out
+
+
 
     @cached_property
     def to_sparse_matrix(self) -> csr_matrix:
@@ -932,7 +1071,7 @@ class QuantumState:
     @classmethod
     def haar_random(cls,
                     n_qubits: int,
-                    vec_type: str) -> "QuantumState":
+                    vec_type: str='ket') -> "QuantumState":
         """
         Generate a Haar random quantum state - (uniform random quantum state).
 
@@ -953,10 +1092,24 @@ class QuantumState:
 
         qstate_random = cls.from_array(haar_vec)
         return qstate_random
+    
+    @classmethod
+    def random_state(cls, num_qubits: int, num_terms: int, vec_type: str='ket') -> "QuantumState":
+        """ Generates a random normalized QuantumState, but not from Haar distribution
+        """
+        # random binary array with N columns, M rows
+        random_state = np.random.randint(0,2,(num_terms,num_qubits))
+        # random vector of coefficients
+        coeff_vec = (
+            np.random.rand(num_terms) + 
+            np.random.rand(num_terms)*1j
+        )
+        return QuantumState(random_state, coeff_vec, vec_type=vec_type).normalize
+    
     @classmethod
     def zero_state(cls,
                     n_qubits: int,
-                    vec_type: str) -> "QuantumState":
+                    vec_type: str='ket') -> "QuantumState":
         """
         Generate the all zero state on N qubits
 
@@ -1300,15 +1453,24 @@ class QuantumState:
         Qstate = cls(state_matrix, coeff_vector, vec_type=vec_type)
         return Qstate
 
-    def plot_state(self, logscale:bool = False):
+    def plot_state(self, 
+            logscale:bool = False, 
+            probability_threshold:float=None,
+            dpi:int=100
+        ):
 
         assert self._is_normalized(), 'should only plot normalized quantum states'
 
         # clean duplicate states and set amplitdue threshold
-        q_state = self.cleanup()
+        if probability_threshold is not None:
+            assert probability_threshold>=0 and probability_threshold<=1, 'Probability threshold is a number between 0 and 1.'
+            zero_threshold = np.sqrt(probability_threshold)
+        else:
+            zero_threshold = None
+        q_state = self.cleanup(zero_threshold=zero_threshold)
         prob = np.abs(q_state.state_op.coeff_vec) ** 2
 
-        fig, ax = plt.subplots(1, 1)
+        fig, ax = plt.subplots(1, 1, dpi=dpi)
 
         if q_state.state_op.n_qubits<64:
             x_binary_ints = q_state.state_matrix @ (1 << np.arange(q_state.state_matrix.shape[1])[::-1])
@@ -1318,6 +1480,7 @@ class QuantumState:
         if prob.shape[0]<2**8:
             # bar chart
             ax.bar(x_binary_ints, prob, width=1, edgecolor="white", linewidth=0.8)
+            ax.set_xticks(x_binary_ints, labels=x_binary_ints.astype(str))
         else:
             # line plot
             sort_inds = np.argsort(x_binary_ints)
@@ -1325,8 +1488,125 @@ class QuantumState:
             y_data = prob[sort_inds]
             ax.plot(x_data, y_data)
         ax.set(xlabel='binary output', ylabel='probability amplitude')
-
+        
         if logscale:
             ax.set_yscale('log')
 
         return (ax)
+
+
+def get_PauliwordOp_projector(projector: Union[str, List[str], np.array]) -> "PauliwordOp":
+    """
+    Build PauliwordOp projector onto different qubit states. Using I to leave state unchanged and 0,1,+,-,*,% to fix
+    qubit.
+
+    key:
+        I leaves qubit unchanged
+        0,1 fixes qubit as |0>, |1> (Z basis)
+        +,- fixes qubit as |+>, |-> (X basis)
+        *,% fixes qubit as |i+>, |i-> (Y basis)
+
+    e.g.
+     'I+0*1II' defines the projector the state I ⊗ [ |+ 0 i+ 1>  <+ 0 i+ 1| ]  ⊗ II
+
+    TODO: could be used to develop a control version of PauliWordOp
+
+    Args:
+        projector (str, list) : either string or list of strings defininng projector
+
+    Returns:
+        projector (PauliwordOp): operator that performs projection
+    """
+    if isinstance(projector, str):
+        projector = np.array(list(projector))
+    else:
+        projector = np.asarray(projector)
+    basis_dict = {'I':1,
+                  '0':0, '1':1,
+                  '+':0, '-':1,
+                  '*':0, '%':1}
+    assert len(projector.shape) == 1, 'projector can only be defined over a single string or single list of strings (each a single letter)'
+    assert set(projector).issubset(list(basis_dict.keys())), 'unknown qubit state (must be I,X,Y,Z basis)'
+
+
+    N_qubits = len(projector)
+    qubit_inds_to_fix = np.where(projector!='I')[0]
+    N_qubits_fixed = len(qubit_inds_to_fix)
+    state_sign = np.array([basis_dict[projector[active_ind]] for active_ind in qubit_inds_to_fix])
+
+    if N_qubits_fixed < 64:
+        binary_vec = (((np.arange(2 ** N_qubits_fixed).reshape([-1, 1]) & (1 << np.arange(N_qubits_fixed))[
+                                                                          ::-1])) > 0).astype(int)
+    else:
+        binary_vec = (((np.arange(2 ** N_qubits_fixed, dtype=object).reshape([-1, 1]) & (1 << np.arange(N_qubits_fixed,
+                                                                                                        dtype=object))[
+                                                                                        ::-1])) > 0).astype(int)
+
+    # # assign a sign only to 'active positions' (0 in binary not relevent)
+    # sign_from_binary = binary_vec * state_sign
+    #
+    # # need to turn 0s in matrix to 1s before taking product across rows
+    # sign_from_binary = sign_from_binary + (sign_from_binary + 1) % 2
+    #
+    # sign = np.product(sign_from_binary, axis=1)
+
+    sign = (-1)**((binary_vec@state_sign.T)%2)
+
+    coeff = 1 / 2 ** (N_qubits_fixed) * np.ones(2 ** N_qubits_fixed)
+    sym_arr = np.zeros((coeff.shape[0], 2 * N_qubits))
+
+    # assumed in Z basis
+    sym_arr[:, qubit_inds_to_fix + N_qubits] = binary_vec
+    sym_arr = sym_arr.astype(bool)
+
+    ### fix for Y and X basis
+
+    X_inds_fixed = np.where(np.logical_or(projector == '+', projector == '-'))[0]
+    # swap Z block and X block
+    (sym_arr[:, X_inds_fixed],
+     sym_arr[:,  X_inds_fixed+N_qubits]) = (sym_arr[:, X_inds_fixed+N_qubits],
+                                            sym_arr[:, X_inds_fixed].copy())
+
+    # copy Z block into X block
+    Y_inds_fixed = np.where(np.logical_or(projector == '*', projector == '%'))[0]
+    sym_arr[:, Y_inds_fixed] = sym_arr[:, Y_inds_fixed + N_qubits]
+
+    projector = PauliwordOp(sym_arr, coeff * sign)
+    return projector
+
+
+def get_ij_operator(i,j,n_qubits,binary_vec=None):
+    """
+    """
+    if n_qubits > 30:
+        raise ValueError('Too many qubits, might run into memory limitations.')
+
+    if binary_vec is None:
+        binary_vec = (
+            ((np.arange(2 ** n_qubits).reshape([-1, 1]) & 
+            (1 << np.arange(n_qubits))[::-1])) > 0
+        ).astype(bool)
+
+    left  = np.array([int(i) for i in np.binary_repr(i, width=n_qubits)]).astype(bool)
+    right = np.array([int(i) for i in np.binary_repr(j, width=n_qubits)]).astype(bool)
+
+    AND = left & right # AND where -1 sign
+    XZX_sign_flips = (-1) ** np.sum(AND & binary_vec, axis=1) # XZX = -X multiplications
+        
+    if i != j:
+        XOR = left ^ right # XOR where +-i phase
+
+        XZ_mult = left & binary_vec
+        ZX_mult = binary_vec & right
+
+        XZ_phase = (-1j) ** np.sum(XZ_mult & ~ZX_mult, axis=1) # XZ=-iY multiplications
+        ZX_phase = (+1j) ** np.sum(ZX_mult & ~XZ_mult, axis=1) # ZX=+iY multiplications
+        phase_mod = XZX_sign_flips * XZ_phase * ZX_phase
+        
+        ij_symp_matrix = np.hstack([np.tile(XOR, [2**n_qubits, 1]), binary_vec])
+        ij_operator= PauliwordOp(ij_symp_matrix, phase_mod/2**n_qubits)
+    else:
+        ij_symp_matrix = np.hstack([np.zeros_like(binary_vec), binary_vec])
+        ij_operator= PauliwordOp(ij_symp_matrix, XZX_sign_flips/2**n_qubits)
+    
+    return ij_operator
