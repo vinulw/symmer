@@ -382,8 +382,81 @@ def test_pauliwordop_to_mpo():
     plt.plot(Dmaxs, tdists, 'x--')
     plt.show()
 
+def experiment_profiling_D(debug=False):
+    import os
+    from tqdm import tqdm
+    from quimb.tensor.tensor_1d import MatrixProductOperator
+    from quimb.tensor.tensor_dmrg import DMRG2
+    from symmer.symplectic import QuantumState
+    from symmer.utils import exact_gs_energy
+    from symmer.symplectic.base import PauliwordOp
+    from datetime import datetime
+    import json
 
+    now = datetime.now().strftime("%d%m%y%H%M%S")
+    output_fname = f"{now}_profiling_D_squential_MPO.csv"
+
+    test_dir = os.path.join(os.path.dirname(os.getcwd()), 'tests')
+    ham_data_dir = os.path.join(test_dir, 'hamiltonian_data')
+
+    filtered_files = []
+    with open('filtered_hamiltonians_10qb.txt', 'r') as f:
+        for curr in f:
+            filtered_files.append(curr.rstrip('\n'))
+
+    data_dicts = []
+
+    for f in filtered_files:
+        with open(os.path.join(ham_data_dir, f), 'r') as infile:
+            data_dicts.append(json.load(infile))
+
+    with open(output_fname, 'w') as f:
+        f.write("File, D,  GS Overlap, GS Energy, HF Energy, DMRG2 Energy\n")
+
+    D_range = [16, 32, 64, 128]
+    for D in tqdm(D_range):
+        tqdm.write(f"D : {D}")
+        for fl, dct in zip(tqdm(filtered_files), data_dicts):
+            tqdm.write(f'Calculating properties for {fl}...')
+            pstrings, coefflist = zip(*dct['hamiltonian'].items())
+            coeffs = coefflist_to_complex(coefflist)
+            H_op = PauliwordOp.from_dictionary(dct['hamiltonian'])
+
+            # Make MPO
+            mpo = pstrings_to_mpo(pstrings, coeffs, Dmax=D)
+            mpo = [np.squeeze(m) for m in mpo]
+            MPO = MatrixProductOperator(mpo, 'dulr')
+            tqdm.write("   Generated MPO...")
+
+            dmrg = DMRG2(MPO, bond_dims=[10, 20, 100, 100, 200], cutoffs=1e-10)
+            dmrg.solve(verbosity=0, tol=1e-6)
+            tqdm.write("   Found DMRG ground state...")
+
+            dmrg_state = dmrg.state.to_dense()
+            dmrg_state = QuantumState.from_array(dmrg_state).cleanup(zero_threshold=1e-5)
+
+            gs_energy, gs_vec = exact_gs_energy(H_op.to_sparse_matrix)
+            gs_state = QuantumState.from_array(gs_vec).cleanup(zero_threshold=1e-5)
+
+            gs_overlap = np.linalg.norm(gs_state.dagger * dmrg_state)
+
+            gs_energy = -1*np.linalg.norm(gs_state.dagger * H_op * gs_state)
+            dmrg_energy = -1*np.linalg.norm(dmrg_state.dagger * H_op * dmrg_state)
+            hf_energy = dct['data']['calculated_properties']['HF']['energy']
+            tqdm.write("   Calculated Energies...")
+
+            if debug:
+                tqdm.write(f"   GS Overlap: {gs_overlap}")
+                tqdm.write(f"   GS Energy: {gs_energy}")
+                tqdm.write(f"   HF Energy: {hf_energy}")
+                tqdm.write(f"   DMRG Energy: {dmrg_energy}")
+                tqdm.write("")
+
+            output_line = f"{fl}, {D}, {gs_overlap}, {gs_energy}, {hf_energy}, {dmrg_energy}\n"
+            with open(output_fname, 'a') as f:
+                f.write(output_line)
 
 if __name__=="__main__":
 #    test_adding_two_mpos()
-    test_pauliwordop_to_mpo()
+#    test_pauliwordop_to_mpo()
+    experiment_profiling_D()
